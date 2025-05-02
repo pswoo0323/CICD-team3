@@ -1,219 +1,32 @@
-name: CI-CD
-
+name: Build
 on:
   workflow_dispatch:
-  #schedule:
-  #  - cron: '*/5 * * * *'  # 5분마다 워크플로우 실행
-  repository_dispatch:
-    types: [trigger-ci]
-
-jobs:   
-  static-analysis:
-    #needs: check-change
-    #if: needs.check-change.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  build:
+    name: Build
+    runs-on: macos-latest
+    env:
+      BUILD_WRAPPER_OUT_DIR: build_wrapper_output_directory # Directory where build-wrapper output will be placed
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-    
-      - name: Clone repository and check out target SHA
-        run: |
-          git clone https://github.com/yoona96/Dev-Sample-Repo repo-temp
-          cd repo-temp
-          git checkout ${{ needs.check-change.outputs.latest_sha }}
-          mv source-code ../source-code
-          mv sonar-project.properties ../sonar-project.properties
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake cppcheck clang-tidy gcovr libgtest-dev jq flawfinder
-
-      - name: Install Google Test
-        run: |
-          cd /usr/src/gtest
-          sudo cmake .
-          sudo make
-          sudo cp lib/*.a /usr/lib
-
-      - name: Download build-wrapper
-        run: |
-          curl -sSLo build-wrapper-linux-x86.zip https://sonarcloud.io/static/cpp/build-wrapper-linux-x86.zip
-          unzip build-wrapper-linux-x86.zip
-
-      - name: Build with Coverage (wrapped by SonarCloud build-wrapper)
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Install Build Wrapper
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v4
+      - name: Run Build Wrapper
         run: |
           mkdir build
-          cd build
-          cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_FLAGS="--coverage -O0" ../source-code
-          ../build-wrapper-linux-x86/build-wrapper-linux-x86-64 --out-dir ../bw-output make
-          make
-          ctest --output-on-failure || true
-
-      - name: Run cppcheck
-        run: |
-          cppcheck --enable=all --inconclusive --std=c++17 --language=c++ \
-                   -I source-code/include source-code/src 2> cppcheck-report.txt
-
-      - name: Display cppcheck Report
-        run: cat cppcheck-report.txt
-
-      - name: Run flawfinder
-        run: |
-          flawfinder --columns source-code/src > flawfinder-report.txt
-
-      - name: Display flawfinder Report
-        run: |
-          cat flawfinder-report.txt
-
-      - name: Create flawfinder issue table
-        run: |
-          echo "| File | Line | Risk | Description |" > flawfinder-issues.md
-          echo "|------|------|------|-------------|" >> flawfinder-issues.md
-      
-          awk '
-            BEGIN { IGNORECASE=1 }
-            /^[0-9]+:/ {
-              split($0, parts, ":")
-              file=parts[1]
-              line=parts[2]
-              desc=$0
-              sub(/^[^:]+:[^:]+:/, "", desc)
-              gsub(/\|/, "\\|", desc)
-              risk="?"
-      
-              if (desc ~ /[Rr]isk\s+level\s+([0-9]+)/) {
-                match(desc, /[Rr]isk\s+level\s+([0-9]+)/, riskMatch)
-                risk = riskMatch[1]
-              }
-      
-              printf("| %s | %s | %s | %s |\n", file, line, risk, desc)
-            }
-          ' flawfinder-report.txt >> flawfinder-issues.md
-
-      - name: Run clang-tidy
-        run: |
-          mkdir -p clang-tidy-report
-          find source-code -name '*.cpp' | while read file; do
-            echo "Checking $file" >> clang-tidy-report/report.txt
-            clang-tidy "$file" -p build >> clang-tidy-report/report.txt 2>&1 || true
-          done
-
-      - name: Display clang-tidy Report
-        run: cat clang-tidy-report/report.txt
-
-      - name: ✅ Generate Coverage Report (Ignore CMake & errors)
-        run: |
-          gcovr --sonarqube -r source-code --object-directory build \
-                --exclude ".*CMakeFiles.*" \
-                --gcov-ignore-errors=no_working_dir_found \
-                --fail-under-line 0 \
-                -o coverage.xml
-      
-      - name: 📋 Validate coverage.xml
-        run: |
-          if grep -q "<file" coverage.xml; then
-            echo "✅ 유효한 커버리지 데이터가 있습니다."
-          else
-            echo "⚠️ coverage.xml이 비어 있습니다. SonarCloud 분석을 생략합니다."
-            exit 78
-          fi
-
-      - name: Show Coverage Report
-        run: cat coverage.xml
-      
-      - name: 🚀 Run SonarCloud Analysis
-        uses: SonarSource/sonarqube-scan-action@v5.0.0
-        if: success()
+          cmake -S . -B build
+          build-wrapper-macosx-x86 --out-dir ${{ env.BUILD_WRAPPER_OUT_DIR }} cmake --build build/ --config Release
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }} # Put the name of your token here
         with:
           args: >
-            -Dsonar.projectKey=yoona96_Dev-Sample-Repo
-            -Dsonar.organization=yoona96
-            -Dsonar.sources=source-code/src
-            -Dsonar.cfamily.build-wrapper-output=bw-output
-            -Dsonar.coverageReportPaths=coverage.xml
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-      - name: Fetch SonarCloud issues
-        run: |
-          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
-            "https://sonarcloud.io/api/issues/search?projectKeys=yoona96_Dev-Sample-Repo&resolved=false&pageSize=500" \
-            -o sonar-issues.json
-
-      - name: 📤 Commit updated static-analysis artifacts
-        run: |
-          git config user.name  "github-actions"
-          git config user.email "github-actions@github.com"
-
-          # 스테이징
-          git add cppcheck-report.txt \
-                  clang-tidy-report/report.txt \
-                  flawfinder-issues.md \
-                  coverage.xml
-
-          # 변경 여부 확인 후 커밋/푸시
-          if ! git diff --cached --quiet; then
-            git commit -m "Update static analysis artifacts"
-            git push
-            echo "✅ 분석 결과 파일을 저장소에 푸시했습니다."
-          else
-            echo "ℹ️  변경된 분석 결과 파일이 없어 커밋을 생략합니다."
-          fi
-
-      - name: 📝 Merge all static analysis results into issue-body.md
-        run: |
-          echo "# 📊 Static Analysis Summary Report" > issue-body.md
-
-          ## cppcheck 테이블
-          echo -e "\n## 🚨 cppcheck Results\n" >> issue-body.md
-          echo "| Message | File | Line |" >> issue-body.md
-          echo "|---------|------|------|" >> issue-body.md
-          grep "\[" cppcheck-report.txt | sed -E 's|(.+):([0-9]+):(.+)\[(.+)\]|\4 | \1 | \2 | \3|' \
-            | while IFS="|" read -r msg file line desc; do
-              echo "| ${msg:-Warning} | ${file:-N/A} | ${line:-N/A} |" >> issue-body.md
-            done || echo "✅ No cppcheck issues found." >> issue-body.md
-
-          ## clang-tidy 테이블
-          echo -e "\n## 🧹 clang-tidy Results\n" >> issue-body.md
-          echo "| File | Description |" >> issue-body.md
-          echo "|------|-------------|" >> issue-body.md
-          grep -E "warning:|error:" clang-tidy-report/report.txt | while read line; do
-            file=$(echo "$line" | cut -d':' -f1)
-            desc=$(echo "$line" | cut -d':' -f4-)
-            echo "| $file | $desc |" >> issue-body.md
-          done || echo "✅ No clang-tidy issues found." >> issue-body.md
-
-          ## flawfinder 테이블
-          echo -e "\n## 🔐 flawfinder Results\n" >> issue-body.md
-          echo "| File | Line | Risk | Description |" >> issue-body.md
-          echo "|------|------|------|-------------|" >> issue-body.md
-          cat flawfinder-issues.md >> issue-body.md || echo "✅ No flawfinder issues." >> issue-body.md
-
-          ## coverage 테이블
-          echo -e "\n## 📈 Coverage Summary\n" >> issue-body.md
-          if grep -q "<file" coverage.xml; then
-            covered=$(grep -oP 'line-rate="\K[0-9.]+' coverage.xml | head -n1)
-            echo "| Coverage | ${covered:-N/A} |" >> issue-body.md
-          else
-            echo "| Coverage | N/A (No coverage data found) |" >> issue-body.md
-          fi
-
-          ## SonarCloud 이슈 테이블
-          echo -e "\n## ☁️ SonarCloud Issues\n" >> issue-body.md
-          echo "| Type | Severity | File | Line | Description |" >> issue-body.md
-          echo "|------|----------|------|------|-------------|" >> issue-body.md
-          jq -r '.issues[] | "| \(.type) | \(.severity) | \(.component | sub(".*src/"; "")) | \(.line // "N/A") | \(.message | gsub("[\r\n]"; " ")) |"' sonar-issues.json >> issue-body.md || echo "✅ No SonarCloud issues." >> issue-body.md
-
-      - name: Create GitHub Issue with Full Static Analysis Results
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ $(wc -l < issue-body.md) -gt 10 ]; then
-            gh issue create \
-              --title "🔍 정적 분석 통합 리포트" \
-              --body-file issue-body.md
-          else
-            echo "✅ 분석 결과에 등록할 이슈가 없습니다."
-          fi
+            --define sonar.cfamily.compile-commands="${{ env.BUILD_WRAPPER_OUT_DIR }}/compile_commands.json"
