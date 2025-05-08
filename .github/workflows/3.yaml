@@ -58,3 +58,22 @@ jobs:
             -Dsonar.projectKey=pswoo0323_CICD-team3
             -Dsonar.organization=pswoo0323
             -Dsonar.cfamily.compile-commands=build_wrapper_output_directory/compile_commands.json
+
+
+     # 빌드 성공 시 Discord 알림
+      - name: Discord Success Notification
+        if: success()
+        uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        with:
+          args: '✅ **빌드 성공**: ${{ github.repository }} - ${{ github.workflow }} 워크플로우 성공!'
+
+      # 빌드 실패 시 Discord 알림
+      - name: Discord Failure Notification
+        if: failure()
+        uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        with:
+          args: '❌ **빌드 실패**: ${{ github.repository }} - ${{ github.workflow }} 워크플로우 실패! 확인 필요!'
